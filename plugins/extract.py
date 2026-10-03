@@ -18,13 +18,13 @@ from dreamxbotz.util.file_properties import get_name
 logger = logging.getLogger(__name__)
 
 # Telegraph init
-TELEGRAPH_ACCESS_TOKEN = os.environ.get("TELEGRAPH_ACCESS_TOKEN") or "38a8ac190ac77ad863fa0c3fa98bdf0bb563fa200211b168062e5313b401"
+TELEGRAPH_ACCESS_TOKEN = os.environ.get("TELEGRAPH_ACCESS_TOKEN") or "6288219713e387a679586a9a184b6be21b795770e11f60d6006bd0005342"
 if TELEGRAPH_ACCESS_TOKEN:
     telegraph = Telegraph(access_token=TELEGRAPH_ACCESS_TOKEN)
 else:
     telegraph = Telegraph()
     try:
-        telegraph.create_account(short_name="DreamxBotz")
+        telegraph.create_account(short_name="ASVM")
     except Exception:
         logger.exception("Failed to create Telegraph account")
 
@@ -217,7 +217,7 @@ async def extract_data_handler(client: Client, query: CallbackQuery):
                 for btn in row:
                     if btn.callback_data == query.data:
                         new_row.append(
-                            InlineKeyboardButton("📝 ᴠɪᴇᴡ ᴛʀᴀᴄᴋꜱ 📝", url=telegraph_url)
+                            InlineKeyboardButton("• ᴠɪᴇᴡ ᴛʀᴀᴄᴋꜱ •", url=telegraph_url)
                         )
                     else:
                         new_row.append(btn)
