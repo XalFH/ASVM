@@ -1,17 +1,16 @@
-FROM python:3.12.2
+FROM python:3.12-slim
+
+WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends mediainfo libmediainfo0v5 libmediainfo-dev ca-certificates && \
-    ldconfig && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-WORKDIR /DreamxBotz
+    apt-get install -y --no-install-recommends \
+    mediainfo \
+    libmediainfo0v5 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip --root-user-action=ignore && \
-    pip install --no-cache-dir -r requirements.txt --root-user-action=ignore
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python3", "bot.py"]
+CMD ["python", "bot.py"]
