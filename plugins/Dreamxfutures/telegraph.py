@@ -506,3 +506,32 @@ async def screenshots_handler(
             return
 
         # --------------------------------
+    except Exception as e:
+        logger.exception(
+            "Screenshot extraction failed: %s",
+            e
+        )
+
+        try:
+            await query.message.reply_text(
+                "❌ <b>Screenshot extraction failed.</b>\n\n"
+                f"<code>{e}</code>"
+            )
+        except Exception:
+            pass
+
+    finally:
+        if cached_message:
+            try:
+                await cached_message.delete()
+            except Exception:
+                pass
+
+        try:
+            if os.path.exists(work_dir):
+                shutil.rmtree(
+                    work_dir,
+                    ignore_errors=True
+                )
+        except Exception:
+            pass
