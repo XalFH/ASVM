@@ -501,26 +501,98 @@ async def start(client, message):
 async def stream_buttons(user_id: int, file_id: str):
     if STREAM_MODE and not PREMIUM_STREAM_MODE:
         return [
-            [InlineKeyboardButton('• ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ •', callback_data=f'generate_stream_link:{file_id}')],
-            [InlineKeyboardButton('• ᴠɪᴇᴡ ᴀᴜᴅɪᴏ & ꜱᴜʙꜱ ɪɴꜰᴏ •', callback_data=f'extract_data:{file_id}')],
-            [InlineKeyboardButton('ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ', url=UPDATE_CHNL_LNK)]
+            [
+                InlineKeyboardButton(
+                    '• ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ •',
+                    callback_data=f'generate_stream_link:{file_id}'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    '• ᴠɪᴇᴡ ᴀᴜᴅɪᴏ & ꜱᴜʙꜱ ɪɴꜰᴏ •',
+                    callback_data=f'extract_data:{file_id}'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    '• 📸 ᴠɪᴇᴡ ꜱᴄʀᴇᴇɴꜱʜᴏᴛꜱ •',
+                    callback_data=f'screenshots:{file_id}'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    'ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ',
+                    url=UPDATE_CHNL_LNK
+                )
+            ]
         ]
+
     elif STREAM_MODE and PREMIUM_STREAM_MODE:
+
         if not await db.has_premium_access(user_id):
             return [
-                [InlineKeyboardButton('• ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ •', callback_data='prestream')],
-                [InlineKeyboardButton('• ᴠɪᴇᴡ ᴀᴜᴅɪᴏ & ꜱᴜʙꜱ ɪɴꜰᴏ •', callback_data='prestream')],
-                [InlineKeyboardButton('ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ', url=UPDATE_CHNL_LNK)]
+                [
+                    InlineKeyboardButton(
+                        '• ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ •',
+                        callback_data='prestream'
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        '• ᴠɪᴇᴡ ᴀᴜᴅɪᴏ & ꜱᴜʙꜱ ɪɴꜰᴏ •',
+                        callback_data='prestream'
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        '• 📸 ᴠɪᴇᴡ ꜱᴄʀᴇᴇɴꜱʜᴏᴛꜱ •',
+                        callback_data='prestream'
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        'ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ',
+                        url=UPDATE_CHNL_LNK
+                    )
+                ]
             ]
-        else:
-            return [
-                [InlineKeyboardButton('• ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ •', callback_data=f'generate_stream_link:{file_id}')],
-                [InlineKeyboardButton('• ᴠɪᴇᴡ ᴀᴜᴅɪᴏ & ꜱᴜʙꜱ ɪɴꜰᴏ •', callback_data=f'extract_data:{file_id}')],
-                [InlineKeyboardButton('ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ', url=UPDATE_CHNL_LNK)]
+
+        return [
+            [
+                InlineKeyboardButton(
+                    '• ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ / ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ •',
+                    callback_data=f'generate_stream_link:{file_id}'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    '• ᴠɪᴇᴡ ᴀᴜᴅɪᴏ & ꜱᴜʙꜱ ɪɴꜰᴏ •',
+                    callback_data=f'extract_data:{file_id}'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    '• 📸 ᴠɪᴇᴡ ꜱᴄʀᴇᴇɴꜱʜᴏᴛꜱ •',
+                    callback_data=f'screenshots:{file_id}'
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    'ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ',
+                    url=UPDATE_CHNL_LNK
+                )
             ]
-    else:
-        return [[InlineKeyboardButton('ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ', url=UPDATE_CHNL_LNK)]]
-    
+        ]
+
+    return [
+        [
+            InlineKeyboardButton(
+                'ᴊᴏɪɴ ᴜᴘᴅᴀᴛᴇꜱ ᴄʜᴀɴɴᴇʟ',
+                url=UPDATE_CHNL_LNK
+            )
+        ]
+    ]
+        
 @Client.on_message(filters.command('logs') & filters.user(ADMINS))
 async def log_file(bot, message):
     """Send log file"""
