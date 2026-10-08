@@ -19,24 +19,42 @@ from info import BIN_CHANNEL
 from database.ia_filterdb import get_file_details
 
 
+# ============================================================
+# LOGGER
+# ============================================================
+
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# IMGBB
+# IMGBB CONFIG
 # ============================================================
 
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY")
+
 IMGBB_URL = "https://api.imgbb.com/1/upload"
 
+
+# ============================================================
+# UPLOAD IMAGE TO IMGBB
+# ============================================================
 
 async def upload_to_imgbb(file_path: str):
 
     if not IMGBB_API_KEY:
-        logger.error("IMGBB_API_KEY is not set")
+        logger.error(
+            "IMGBB_API_KEY environment variable is missing."
+        )
+        return None
+
+    if not file_path:
         return None
 
     if not os.path.exists(file_path):
+        logger.error(
+            "File does not exist: %s",
+            file_path
+        )
         return None
 
     try:
@@ -72,10 +90,15 @@ async def upload_to_imgbb(file_path: str):
             ) as response:
 
                 if response.status != 200:
+
+                    error_text = await response.text()
+
                     logger.error(
-                        "ImgBB HTTP error: %s",
-                        response.status
+                        "ImgBB HTTP %s: %s",
+                        response.status,
+                        error_text
                     )
+
                     return None
 
                 result = await response.json(
@@ -84,10 +107,18 @@ async def upload_to_imgbb(file_path: str):
 
         if result.get("success"):
 
-            return result["data"]["url"]
+            data = result.get(
+                "data",
+                {}
+            )
+
+            return (
+                data.get("url")
+                or data.get("display_url")
+            )
 
         logger.error(
-            "ImgBB response: %s",
+            "ImgBB upload failed: %s",
             result
         )
 
@@ -104,14 +135,19 @@ async def upload_to_imgbb(file_path: str):
 
 
 # ============================================================
-# OLD /IMG COMMAND
+# OLD /IMG /CUP /TELEGRAPH COMMAND
 # ============================================================
 
 @Client.on_message(
     filters.command(
-        ["img", "cup", "telegraph"],
+        [
+            "img",
+            "cup",
+            "telegraph"
+        ],
         prefixes="/"
-    ) & filters.reply
+    )
+    & filters.reply
 )
 async def c_upload(
     client: Client,
@@ -132,14 +168,21 @@ async def c_upload(
             "Please reply to an image."
         )
 
+    # --------------------------------------------------------
+    # DOCUMENT SIZE LIMIT
+    # --------------------------------------------------------
+
     if reply.document:
 
-        file_size = reply.document.file_size or 0
+        file_size = (
+            reply.document.file_size
+            or 0
+        )
 
         if file_size > 5 * 1024 * 1024:
 
             return await message.reply_text(
-                "File size limit is 5 MB."
+                "❌ File size limit is 5 MB."
             )
 
     msg = await message.reply_text(
@@ -150,6 +193,10 @@ async def c_upload(
 
     try:
 
+        # ----------------------------------------------------
+        # DOWNLOAD
+        # ----------------------------------------------------
+
         downloaded_media = await reply.download()
 
         if (
@@ -157,9 +204,15 @@ async def c_upload(
             or not os.path.exists(downloaded_media)
         ):
 
-            return await msg.edit_text(
-                "❌ Download failed."
+            await msg.edit_text(
+                "❌ Something went wrong during download."
             )
+
+            return
+
+        # ----------------------------------------------------
+        # IMGBB
+        # ----------------------------------------------------
 
         image_url = await upload_to_imgbb(
             downloaded_media
@@ -167,9 +220,16 @@ async def c_upload(
 
         if not image_url:
 
-            return await msg.edit_text(
-                "❌ ImgBB upload failed."
+            await msg.edit_text(
+                "❌ ImgBB upload failed.\n\n"
+                "Please check the ImgBB API key."
             )
+
+            return
+
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
 
         await msg.edit_text(
             "🖼️ <b>ImgBB URL:</b>\n\n"
@@ -178,12 +238,16 @@ async def c_upload(
 
     except Exception as e:
 
-        logger.exception(e)
+        logger.exception(
+            "Normal ImgBB upload error: %s",
+            e
+        )
 
         try:
 
             await msg.edit_text(
-                f"❌ Error:\n<code>{e}</code>"
+                "❌ <b>Error:</b>\n\n"
+                f"<code>{e}</code>"
             )
 
         except Exception:
@@ -203,7 +267,7 @@ async def c_upload(
 
 
 # ============================================================
-# COMMAND RUNNER
+# RUN COMMAND
 # ============================================================
 
 async def run_command(*args):
@@ -218,50 +282,70 @@ async def run_command(*args):
 
     return (
         process.returncode,
-        stdout.decode(errors="ignore"),
-        stderr.decode(errors="ignore")
+        stdout.decode(
+            errors="ignore"
+        ),
+        stderr.decode(
+            errors="ignore"
+        )
     )
 
 
 # ============================================================
-# VIDEO DURATION
+# GET VIDEO DURATION
 # ============================================================
 
-async def get_video_duration(video_path):
+async def get_video_duration(
+    video_path
+):
 
     try:
 
         code, stdout, stderr = await run_command(
+
             "ffprobe",
+
             "-v",
             "error",
+
             "-show_entries",
             "format=duration",
+
             "-of",
             "default=noprint_wrappers=1:nokey=1",
+
             video_path
         )
 
         if code != 0:
+
             logger.error(
-                "ffprobe error: %s",
+                "FFprobe error: %s",
                 stderr
             )
-            return None
 
-        return float(
-            stdout.strip()
-        )
+            return None, stderr
+
+        value = stdout.strip()
+
+        if not value:
+
+            return None, "Duration not found."
+
+        return float(value), None
 
     except Exception as e:
 
-        logger.exception(e)
+        logger.exception(
+            "FFprobe exception: %s",
+            e
+        )
 
-        return None
+        return None, str(e)
 
 
 # ============================================================
-# SCREENSHOT EXTRACTION
+# EXTRACT SCREENSHOT USING FFMPEG
 # ============================================================
 
 async def extract_screenshot(
@@ -272,101 +356,142 @@ async def extract_screenshot(
 
     try:
 
-        code, stdout, stderr = await run_command(
+        process = await asyncio.create_subprocess_exec(
+
             "ffmpeg",
+
             "-y",
+
             "-ss",
             str(timestamp),
+
             "-i",
             video_path,
+
             "-frames:v",
             "1",
+
             "-q:v",
             "2",
-            output_path
+
+            "-vf",
+            "scale='min(1280,iw)':-2",
+
+            output_path,
+
+            stdout=asyncio.subprocess.PIPE,
+
+            stderr=asyncio.subprocess.PIPE
         )
 
-        if code != 0:
+        stdout, stderr = await process.communicate()
+
+        error = stderr.decode(
+            errors="ignore"
+        )
+
+        if process.returncode != 0:
 
             logger.error(
                 "FFmpeg error: %s",
-                stderr
+                error
             )
 
-            return False
+            return False, error[-3000:]
 
-        return (
-            os.path.exists(output_path)
-            and os.path.getsize(output_path) > 0
-        )
+        if not os.path.exists(
+            output_path
+        ):
+
+            return False, (
+                "Screenshot file was not created."
+            )
+
+        if os.path.getsize(
+            output_path
+        ) <= 0:
+
+            return False, (
+                "Screenshot file is empty."
+            )
+
+        return True, None
 
     except Exception as e:
 
-        logger.exception(e)
+        logger.exception(
+            "Screenshot extraction error: %s",
+            e
+        )
 
-        return False
+        return False, str(e)
 
 
 # ============================================================
-# SCREENSHOT BUTTON
+# SCREENSHOT CALLBACK
 # ============================================================
 
 @Client.on_callback_query(
-    filters.regex(r"^screenshots:")
+    filters.regex(
+        r"^screenshots:"
+    )
 )
 async def screenshots_handler(
     client: Client,
     query: CallbackQuery
 ):
 
-    try:
-
-        await query.answer(
-            "📸 Extracting screenshots...",
-            show_alert=False
-        )
-
-    except Exception:
-        pass
-
-    # Get file ID
-    try:
-
-        file_id = query.data.split(
-            ":",
-            1
-        )[1]
-
-    except Exception:
-
-        return
-
-    work_dir = tempfile.mkdtemp(
-        prefix="asvm_ss_"
-    )
-
-    video_path = os.path.join(
-        work_dir,
-        "video"
-    )
-
-    screenshot_1 = os.path.join(
-        work_dir,
-        "screenshot_1.jpg"
-    )
-
-    screenshot_2 = os.path.join(
-        work_dir,
-        "screenshot_2.jpg"
-    )
+    work_dir = None
 
     cached_message = None
 
+    status = None
+
     try:
 
-        # --------------------------------------------
+        # ----------------------------------------------------
+        # CALLBACK ANSWER
+        # ----------------------------------------------------
+
+        try:
+
+            await query.answer(
+                "📸 Starting screenshot extraction...",
+                show_alert=False
+            )
+
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # GET FILE ID
+        # ----------------------------------------------------
+
+        try:
+
+            file_id = query.data.split(
+                ":",
+                1
+            )[1]
+
+        except Exception:
+
+            return
+
+        # ----------------------------------------------------
+        # STATUS MESSAGE
+        # ----------------------------------------------------
+
+        status = await query.message.reply_text(
+
+            "📸 <b>Screenshot Extractor</b>\n\n"
+            "⏳ Getting video..."
+
+        )
+
+        # ====================================================
         # DATABASE
-        # --------------------------------------------
+        # ====================================================
 
         files_ = await get_file_details(
             file_id
@@ -374,7 +499,7 @@ async def screenshots_handler(
 
         if not files_:
 
-            await query.message.reply_text(
+            await status.edit_text(
                 "❌ File not found in database."
             )
 
@@ -382,9 +507,9 @@ async def screenshots_handler(
 
         file_info = files_[0]
 
-        # --------------------------------------------
+        # ====================================================
         # VIDEO CHECK
-        # --------------------------------------------
+        # ====================================================
 
         if getattr(
             file_info,
@@ -392,16 +517,50 @@ async def screenshots_handler(
             None
         ) != "video":
 
-            await query.message.reply_text(
+            await status.edit_text(
                 "❌ Screenshots are available "
                 "for video files only."
             )
 
             return
 
-        # --------------------------------------------
-        # GET TELEGRAM FILE
-        # --------------------------------------------
+        # ====================================================
+        # CREATE TEMP DIRECTORY
+        # ====================================================
+
+        work_dir = tempfile.mkdtemp(
+            prefix="asvm_screenshot_"
+        )
+
+        video_path = os.path.join(
+            work_dir,
+            "video"
+        )
+
+        screenshot_1 = os.path.join(
+            work_dir,
+            "screenshot_1.jpg"
+        )
+
+        screenshot_2 = os.path.join(
+            work_dir,
+            "screenshot_2.jpg"
+        )
+
+        # ====================================================
+        # DOWNLOAD VIDEO
+        # ====================================================
+
+        await status.edit_text(
+
+            "📥 <b>Downloading video...</b>\n\n"
+            "Please wait..."
+
+        )
+
+        # ----------------------------------------------------
+        # SEND CACHED VIDEO TO BIN CHANNEL
+        # ----------------------------------------------------
 
         cached_message = (
             await client.send_cached_media(
@@ -410,128 +569,411 @@ async def screenshots_handler(
             )
         )
 
-        # --------------------------------------------
-        # DOWNLOAD VIDEO
-        # --------------------------------------------
+        if not cached_message:
+
+            await status.edit_text(
+                "❌ Could not get video from database."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # DOWNLOAD FROM TELEGRAM
+        # ----------------------------------------------------
 
         downloaded = await cached_message.download(
             file_name=video_path
         )
 
-        if (
-            not downloaded
-            or not os.path.exists(downloaded)
-        ):
+        if not downloaded:
 
-            await query.message.reply_text(
-                "❌ Video download failed."
+            await status.edit_text(
+                "❌ Telegram video download failed."
             )
 
             return
 
         video_path = downloaded
 
-        # --------------------------------------------
-        # VIDEO DURATION
-        # --------------------------------------------
+        # ----------------------------------------------------
+        # CHECK FILE
+        # ----------------------------------------------------
 
-        duration = await get_video_duration(
+        if not os.path.exists(
             video_path
+        ):
+
+            await status.edit_text(
+                "❌ Downloaded video file not found."
+            )
+
+            return
+
+        video_size = os.path.getsize(
+            video_path
+        )
+
+        if video_size <= 0:
+
+            await status.edit_text(
+                "❌ Downloaded video is empty."
+            )
+
+            return
+
+        # ====================================================
+        # FFPROBE
+        # ====================================================
+
+        await status.edit_text(
+
+            "🎬 <b>Video downloaded.</b>\n\n"
+            "🔍 Reading video duration..."
+
+        )
+
+        duration, duration_error = (
+            await get_video_duration(
+                video_path
+            )
         )
 
         if not duration:
 
-            await query.message.reply_text(
-                "❌ Unable to read video duration."
+            await status.edit_text(
+
+                "❌ <b>FFprobe failed.</b>\n\n"
+                f"<code>{duration_error}</code>"
+
             )
 
             return
 
-        # --------------------------------------------
-        # SCREENSHOT TIME
-        # --------------------------------------------
+        # ====================================================
+        # CALCULATE TIMESTAMPS
+        # ====================================================
 
-        if duration <= 4:
+        timestamp_1 = max(
+            0.5,
+            duration * 0.30
+        )
 
-            timestamp_1 = max(
-                0.5,
-                duration * 0.25
-            )
-
-            timestamp_2 = max(
-                1.0,
-                duration * 0.75
-            )
-
-        else:
-
-            timestamp_1 = duration * 0.30
-            timestamp_2 = duration * 0.70
+        timestamp_2 = max(
+            1.0,
+            duration * 0.70
+        )
 
         timestamp_1 = min(
             timestamp_1,
-            max(0, duration - 0.2)
+            max(
+                0,
+                duration - 0.2
+            )
         )
 
         timestamp_2 = min(
             timestamp_2,
-            max(0, duration - 0.1)
-        )
-
-        # --------------------------------------------
-        # EXTRACT
-        # --------------------------------------------
-
-        result_1, result_2 = await asyncio.gather(
-
-            extract_screenshot(
-                video_path,
-                screenshot_1,
-                timestamp_1
-            ),
-
-            extract_screenshot(
-                video_path,
-                screenshot_2,
-                timestamp_2
+            max(
+                0,
+                duration - 0.1
             )
         )
 
-        if not result_1 or not result_2:
+        # ====================================================
+        # FFMPEG SCREENSHOT 1
+        # ====================================================
 
-            await query.message.reply_text(
-                "❌ FFmpeg could not extract screenshots."
+        await status.edit_text(
+
+            "🎬 <b>Extracting screenshots...</b>\n\n"
+            "📸 Extracting Screenshot 1..."
+
+        )
+
+        result_1, error_1 = (
+            await extract_screenshot(
+
+                video_path,
+
+                screenshot_1,
+
+                timestamp_1
+            )
+        )
+
+        if not result_1:
+
+            await status.edit_text(
+
+                "❌ <b>Screenshot 1 failed.</b>\n\n"
+                f"<code>{error_1}</code>"
+
             )
 
             return
 
-        # --------------------------------
-    except Exception as e:
-        logger.exception(
-            "Screenshot extraction failed: %s",
-            e
+        # ====================================================
+        # FFMPEG SCREENSHOT 2
+        # ====================================================
+
+        await status.edit_text(
+
+            "🎬 <b>Extracting screenshots...</b>\n\n"
+            "✅ Screenshot 1 extracted\n"
+            "📸 Extracting Screenshot 2..."
+
+        )
+
+        result_2, error_2 = (
+            await extract_screenshot(
+
+                video_path,
+
+                screenshot_2,
+
+                timestamp_2
+            )
+        )
+
+        if not result_2:
+
+            await status.edit_text(
+
+                "❌ <b>Screenshot 2 failed.</b>\n\n"
+                f"<code>{error_2}</code>"
+
+            )
+
+            return
+
+        # ====================================================
+        # IMGBB UPLOAD
+        # ====================================================
+
+        await status.edit_text(
+
+            "☁️ <b>Uploading screenshots to ImgBB...</b>\n\n"
+            "⏳ Please wait..."
+
+        )
+
+        img_1, img_2 = await asyncio.gather(
+
+            upload_to_imgbb(
+                screenshot_1
+            ),
+
+            upload_to_imgbb(
+                screenshot_2
+            )
+        )
+
+        if not img_1:
+
+            await status.edit_text(
+                "❌ Screenshot 1 ImgBB upload failed."
+            )
+
+            return
+
+        if not img_2:
+
+            await status.edit_text(
+                "❌ Screenshot 2 ImgBB upload failed."
+            )
+
+            return
+
+        # ====================================================
+        # SEND SCREENSHOTS TO USER
+        # ====================================================
+
+        await status.edit_text(
+
+            "📤 <b>Sending screenshots...</b>"
+
         )
 
         try:
-            await query.message.reply_text(
-                "❌ <b>Screenshot extraction failed.</b>\n\n"
-                f"<code>{e}</code>"
-            )
-        except Exception:
-            pass
 
-    finally:
-        if cached_message:
+            await client.send_media_group(
+
+                chat_id=query.message.chat.id,
+
+                media=[
+
+                    InputMediaPhoto(
+
+                        screenshot_1,
+
+                        caption="📸 Screenshot 1"
+
+                    ),
+
+                    InputMediaPhoto(
+
+                        screenshot_2,
+
+                        caption="📸 Screenshot 2"
+
+                    )
+
+                ]
+
+            )
+
+        except Exception as media_error:
+
+            logger.warning(
+                "Media group failed: %s",
+                media_error
+            )
+
+            # ------------------------------------------------
+            # FALLBACK
+            # ------------------------------------------------
+
+            await client.send_photo(
+
+                chat_id=query.message.chat.id,
+
+                photo=screenshot_1,
+
+                caption="📸 Screenshot 1"
+
+            )
+
+            await client.send_photo(
+
+                chat_id=query.message.chat.id,
+
+                photo=screenshot_2,
+
+                caption="📸 Screenshot 2"
+
+            )
+
+        # ====================================================
+        # IMGBB BUTTONS
+        # ====================================================
+
+        buttons = InlineKeyboardMarkup(
+
+            [
+
+                [
+
+                    InlineKeyboardButton(
+
+                        "🖼 Screenshot 1",
+
+                        url=img_1
+
+                    ),
+
+                    InlineKeyboardButton(
+
+                        "🖼 Screenshot 2",
+
+                        url=img_2
+
+                    )
+
+                ]
+
+            ]
+
+        )
+
+        # ====================================================
+        # SUCCESS
+        # ====================================================
+
+        await status.edit_text(
+
+            "<b>✅ Screenshots extracted successfully!</b>\n\n"
+            "📸 Both screenshots have been sent above.\n\n"
+            "☁️ Screenshots uploaded to ImgBB.",
+            
+            reply_markup=buttons
+
+        )
+
+    # ========================================================
+    # GLOBAL ERROR
+    # ========================================================
+
+    except Exception as e:
+
+        logger.exception(
+            "Screenshot extraction failed"
+        )
+
+        error_text = str(e)
+
+        if status:
+
             try:
-                await cached_message.delete()
+
+                await status.edit_text(
+
+                    "❌ <b>Screenshot extraction failed.</b>\n\n"
+                    f"<code>{error_text}</code>"
+
+                )
+
             except Exception:
+
                 pass
 
-        try:
-            if os.path.exists(work_dir):
+        else:
+
+            try:
+
+                await query.message.reply_text(
+
+                    "❌ <b>Screenshot extraction failed.</b>\n\n"
+                    f"<code>{error_text}</code>"
+
+                )
+
+            except Exception:
+
+                pass
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    finally:
+
+        # ----------------------------------------------------
+        # DELETE TEMP BIN CHANNEL MESSAGE
+        # ----------------------------------------------------
+
+        if cached_message:
+
+            try:
+
+                await cached_message.delete()
+
+            except Exception:
+
+                pass
+
+        # ----------------------------------------------------
+        # DELETE TEMP FILES
+        # ----------------------------------------------------
+
+        if work_dir:
+
+            try:
+
                 shutil.rmtree(
                     work_dir,
                     ignore_errors=True
                 )
-        except Exception:
-            pass
+
+            except Exception:
+
+                pass
