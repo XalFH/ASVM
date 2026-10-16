@@ -25,6 +25,11 @@ import re
 import math
 import random
 import pytz
+import json
+import time
+import uuid
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 lock = asyncio.Lock()
 
@@ -38,6 +43,366 @@ BUTTONS0 = {}
 BUTTONS1 = {}
 BUTTONS2 = {}
 SPELL_CHECK = {}
+
+
+# ================= PREMIUM PAYMENT API =================
+# The API creates an order and returns payment_url + status_check_url.
+# Price is stored in MongoDB when available; an in-memory fallback keeps the
+# bot usable if the optional settings collection is not exposed by this fork.
+PAYMENT_CREATE_API = "https://checkout.ascinemaa.bond/api.php"
+PAYMENT_API_KEY = "heyupi"
+DEFAULT_MONTHLY_PREMIUM_PRICE = 20
+_PAYMENT_MEMORY = {"monthly_price": DEFAULT_MONTHLY_PREMIUM_PRICE, "orders": {}}
+_PAYMENT_LOCKS = {}
+
+
+def _payment_collection(name):
+    """Return an optional Motor collection without assuming a specific wrapper."""
+    for attr in ("db", "database", "_db"):
+        database = getattr(mdb, attr, None)
+        if database is not None:
+            try:
+                return database[name]
+            except Exception:
+                try:
+                    return getattr(database, name)
+                except Exception:
+                    pass
+    try:
+        return mdb[name]
+    except Exception:
+        return None
+
+
+async def _payment_api_get(url):
+    def _request():
+        request = urllib.request.Request(url, headers={"User-Agent": "PremiumPaymentBot/1.0"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    return await asyncio.to_thread(_request)
+
+
+async def _get_monthly_price():
+    try:
+        collection = _payment_collection("premium_payment_settings")
+        if collection is not None:
+            row = await collection.find_one({"_id": "premium_monthly_price"})
+            if row and int(row.get("amount", 0)) > 0:
+                _PAYMENT_MEMORY["monthly_price"] = int(row["amount"])
+                return int(row["amount"])
+    except Exception:
+        logger.debug("Could not read premium price from MongoDB", exc_info=True)
+    return int(_PAYMENT_MEMORY.get("monthly_price", DEFAULT_MONTHLY_PREMIUM_PRICE))
+
+
+async def _set_monthly_price(amount):
+    _PAYMENT_MEMORY["monthly_price"] = int(amount)
+    try:
+        collection = _payment_collection("premium_payment_settings")
+        if collection is not None:
+            await collection.update_one(
+                {"_id": "premium_monthly_price"},
+                {"$set": {"amount": int(amount), "updated_at": int(time.time())}},
+                upsert=True,
+            )
+    except Exception:
+        logger.exception("Could not persist premium monthly price")
+
+
+async def _save_payment_order(token, order):
+    _PAYMENT_MEMORY["orders"][token] = order
+    try:
+        collection = _payment_collection("premium_payment_orders")
+        if collection is not None:
+            await collection.update_one({"_id": token}, {"$set": order}, upsert=True)
+    except Exception:
+        logger.exception("Could not persist premium payment order")
+
+
+async def _get_payment_order(token):
+    try:
+        collection = _payment_collection("premium_payment_orders")
+        if collection is not None:
+            row = await collection.find_one({"_id": token})
+            if row:
+                return row
+    except Exception:
+        logger.debug("Could not read payment order from MongoDB", exc_info=True)
+    return _PAYMENT_MEMORY["orders"].get(token)
+
+
+async def _update_payment_order(token, changes):
+    order = await _get_payment_order(token) or {}
+    order.update(changes)
+    _PAYMENT_MEMORY["orders"][token] = order
+    try:
+        collection = _payment_collection("premium_payment_orders")
+        if collection is not None:
+            await collection.update_one({"_id": token}, {"$set": changes}, upsert=True)
+    except Exception:
+        logger.exception("Could not update payment order")
+
+
+async def _activate_paid_premium(user_id, months):
+    """Activate premium through the bot's existing user database API."""
+    now = int(time.time())
+    current_expiry = 0
+    try:
+        user = await db.get_user(int(user_id))
+        if isinstance(user, dict):
+            for key in ("expiry_time", "premium_expiry", "expiry_date"):
+                value = user.get(key)
+                if value:
+                    try:
+                        current_expiry = int(float(value))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+    except Exception:
+        logger.debug("Could not read existing premium expiry", exc_info=True)
+    expiry = max(now, current_expiry) + (int(months) * 30 * 24 * 60 * 60)
+    # This project already uses db.update_user for its premium database.
+    await db.update_user(int(user_id), expiry)
+    return expiry
+
+
+async def _is_admin_user(user_id):
+    try:
+        return int(user_id) in {int(admin) for admin in ADMINS}
+    except Exception:
+        return str(user_id) in {str(admin) for admin in ADMINS}
+
+
+@Client.on_message(filters.private & filters.command("pset"))
+async def set_premium_monthly_price(client, message):
+    if not message.from_user or not await _is_admin_user(message.from_user.id):
+        return await message.reply_text("⛔ You are not authorized to change the premium price.")
+    if len(message.command) != 2:
+        return await message.reply_text("Usage: <code>/pset 20</code>\nSets the premium price per month in INR.", parse_mode=enums.ParseMode.HTML)
+    try:
+        amount = int(message.command[1])
+        if amount < 1 or amount > 100000:
+            raise ValueError
+    except ValueError:
+        return await message.reply_text("❌ Enter a valid amount between ₹1 and ₹100000.")
+    await _set_monthly_price(amount)
+    await message.reply_text(f"✅ Premium monthly price set to <b>₹{amount}</b>.", parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_message(filters.private & filters.command("myplan"))
+async def my_premium_plan(client, message):
+    if not message.from_user:
+        return
+    user = None
+    try:
+        user = await db.get_user(message.from_user.id)
+    except Exception:
+        logger.exception("Could not read user premium plan")
+    expiry = 0
+    if isinstance(user, dict):
+        for key in ("expiry_time", "premium_expiry", "expiry_date"):
+            try:
+                expiry = int(float(user.get(key) or 0))
+                if expiry:
+                    break
+            except (TypeError, ValueError):
+                continue
+    if expiry > int(time.time()):
+        expires_text = datetime.fromtimestamp(expiry, pytz.timezone(TIMEZONE)).strftime("%d %b %Y, %I:%M %p")
+        text = f"✅ <b>Premium Active</b>\n\n📅 Expires: <code>{expires_text}</code>"
+    else:
+        text = "❌ <b>No active paid premium plan found.</b>\n\nUse /plan to view available options."
+    await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_callback_query(filters.regex(r"^(paymonths|checkpay)#"))
+async def premium_payment_callbacks(client, query):
+    data_parts = query.data.split("#")
+    action = data_parts[0]
+    user_id = query.from_user.id
+
+    if action == "paymonths":
+        try:
+            months = int(data_parts[1])
+        except (IndexError, ValueError):
+            return await query.answer("Invalid plan selected.", show_alert=True)
+        if months not in (1, 3, 6, 12):
+            return await query.answer("Invalid plan selected.", show_alert=True)
+        monthly_price = await _get_monthly_price()
+        total_amount = monthly_price * months
+        await query.answer("Creating your payment order...")
+        try:
+            params = urllib.parse.urlencode({"api_key": PAYMENT_API_KEY, "amount": total_amount})
+            response = await _payment_api_get(f"{PAYMENT_CREATE_API}?{params}")
+            payload = response.get("data", response) if isinstance(response, dict) else {}
+            order_id = payload.get("order_id")
+            payment_url = payload.get("payment_url")
+            status_url = payload.get("status_check_url")
+            if not order_id or not payment_url or not status_url:
+                raise ValueError("Payment API response is missing order_id, payment_url, or status_check_url")
+            token = uuid.uuid4().hex[:12]
+            order = {
+                "_id": token,
+                "token": token,
+                "order_id": str(order_id),
+                "user_id": int(user_id),
+                "months": int(months),
+                "amount": int(total_amount),
+                "payment_url": str(payment_url),
+                "status_check_url": str(status_url),
+                "status": "pending",
+                "created_at": int(time.time()),
+            }
+            await _save_payment_order(token, order)
+            caption = (
+                "<b>💳 PREMIUM PAYMENT</b>\n\n"
+                f"📦 Plan: <b>{months} month{'s' if months != 1 else ''}</b>\n"
+                f"💰 Monthly price: <b>₹{monthly_price}</b>\n"
+                f"🧾 Total amount: <b>₹{total_amount}</b>\n"
+                f"🆔 Order ID: <code>{order_id}</code>\n\n"
+                "1. Tap <b>Pay Now</b> and complete the payment.\n"
+                "2. Return here and tap <b>Check Payment</b>.\n"
+                "3. Premium activates only after the gateway confirms success."
+            )
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Pay Now", url=str(payment_url))],
+                [InlineKeyboardButton("✅ Check Payment", callback_data=f"checkpay#{token}")],
+                [InlineKeyboardButton("↩️ Back to Plans", callback_data="pay_plan_menu")],
+            ])
+            await client.edit_message_media(
+                chat_id=query.message.chat.id,
+                message_id=query.message.id,
+                media=InputMediaPhoto(media=SUBSCRIPTION, caption=caption, parse_mode=enums.ParseMode.HTML),
+                reply_markup=buttons,
+            )
+        except Exception as e:
+            logger.exception("Could not create premium payment order")
+            fallback_buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ Manual UPI", callback_data="upi_info")],
+                [InlineKeyboardButton("↩️ Back to Plans", callback_data="pay_plan_menu")],
+            ])
+            try:
+                await client.edit_message_media(
+                    chat_id=query.message.chat.id,
+                    message_id=query.message.id,
+                    media=InputMediaPhoto(
+                        media=SUBSCRIPTION,
+                        caption=("⚠️ <b>Automatic payment is temporarily unavailable.</b>\n\n"
+                                 "Please use the existing manual UPI option.\n\n"
+                                 f"<code>{str(e)[:250]}</code>"),
+                        parse_mode=enums.ParseMode.HTML,
+                    ),
+                    reply_markup=fallback_buttons,
+                )
+            except Exception:
+                await query.answer("Payment API unavailable. Please use manual UPI.", show_alert=True)
+        return
+
+    if action == "checkpay":
+        token = data_parts[1] if len(data_parts) > 1 else ""
+        order = await _get_payment_order(token)
+        if not order:
+            return await query.answer("Order not found. Please create a new order.", show_alert=True)
+        if int(order.get("user_id", 0)) != int(user_id):
+            return await query.answer("This payment order belongs to another user.", show_alert=True)
+        if order.get("status") == "success":
+            return await query.answer("✅ Premium is already activated for this order.", show_alert=True)
+
+        lock = _PAYMENT_LOCKS.setdefault(token, asyncio.Lock())
+        async with lock:
+            order = await _get_payment_order(token) or order
+            if order.get("status") == "success":
+                return await query.answer("✅ Premium is already activated for this order.", show_alert=True)
+            if order.get("status") == "processing":
+                return await query.answer("⏳ This order is already being processed. Please wait or contact support if premium does not activate.", show_alert=True)
+            try:
+                status_response = await _payment_api_get(str(order["status_check_url"]))
+                status_data = status_response.get("data", status_response) if isinstance(status_response, dict) else {}
+                returned_order_id = str(status_data.get("order_id", ""))
+                payment_status = str(status_data.get("payment_status", status_data.get("status", "pending"))).lower()
+                paid_amount = status_data.get("amount")
+                if returned_order_id != str(order.get("order_id")):
+                    return await query.answer("❌ Order verification failed. Contact support.", show_alert=True)
+                try:
+                    amount_matches = paid_amount is not None and round(float(paid_amount), 2) == round(float(order["amount"]), 2)
+                except (TypeError, ValueError):
+                    amount_matches = False
+                if payment_status not in ("success", "successful", "paid", "completed"):
+                    return await query.answer("⏳ Payment is still pending. Complete payment and try again.", show_alert=True)
+                if not amount_matches:
+                    return await query.answer("❌ Amount verification failed. Please contact support.", show_alert=True)
+                await _update_payment_order(token, {"status": "processing", "transaction_id": status_data.get("transaction_id")})
+                try:
+                    expiry = await _activate_paid_premium(user_id, int(order["months"]))
+                except Exception:
+                    await _update_payment_order(token, {"status": "pending"})
+                    raise
+                await _update_payment_order(token, {
+                    "status": "success",
+                    "transaction_id": status_data.get("transaction_id"),
+                    "verified_at": int(time.time()),
+                    "premium_expiry": int(expiry),
+                })
+                expiry_text = datetime.fromtimestamp(expiry, pytz.timezone(TIMEZONE)).strftime("%d %b %Y, %I:%M %p")
+                try:
+                    await query.message.edit_caption(
+                        caption=("<b>✅ PAYMENT VERIFIED SUCCESSFULLY</b>\n\n"
+                                 f"📦 Plan: <b>{int(order['months'])} month(s)</b>\n"
+                                 f"💰 Amount: <b>₹{int(order['amount'])}</b>\n"
+                                 f"🆔 Order ID: <code>{order['order_id']}</code>\n"
+                                 f"🧾 Transaction ID: <code>{status_data.get('transaction_id') or 'N/A'}</code>\n\n"
+                                 f"🎉 Premium activated until <b>{expiry_text}</b>."),
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📅 My Plan", callback_data="myplan_callback")]]),
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                return await query.answer("✅ Payment verified and premium activated!", show_alert=True)
+            except Exception as e:
+                logger.exception("Premium payment status check failed")
+                return await query.answer("⚠️ Could not verify payment right now. Please try again shortly.", show_alert=True)
+
+
+@Client.on_callback_query(filters.regex(r"^(pay_plan_menu|myplan_callback)$"))
+async def premium_payment_menu_callbacks(client, query):
+    if query.data == "myplan_callback":
+        user = None
+        try:
+            user = await db.get_user(query.from_user.id)
+        except Exception:
+            pass
+        expiry = 0
+        if isinstance(user, dict):
+            for key in ("expiry_time", "premium_expiry", "expiry_date"):
+                try:
+                    expiry = int(float(user.get(key) or 0))
+                    if expiry:
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if expiry > int(time.time()):
+            exp_text = datetime.fromtimestamp(expiry, pytz.timezone(TIMEZONE)).strftime("%d %b %Y, %I:%M %p")
+            return await query.answer(f"Premium active until {exp_text}", show_alert=True)
+        return await query.answer("No active paid premium plan found.", show_alert=True)
+
+    price = await _get_monthly_price()
+    caption = f"<b>💎 CHOOSE YOUR PREMIUM PLAN</b>\n\nMonthly price: <b>₹{price}</b>\nSelect the duration below."
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"1 Month · ₹{price}", callback_data="paymonths#1"), InlineKeyboardButton(f"3 Months · ₹{price * 3}", callback_data="paymonths#3")],
+        [InlineKeyboardButton(f"6 Months · ₹{price * 6}", callback_data="paymonths#6"), InlineKeyboardButton(f"12 Months · ₹{price * 12}", callback_data="paymonths#12")],
+        [InlineKeyboardButton("↩️ Back", callback_data="buy_info")],
+    ])
+    try:
+        await client.edit_message_media(
+            chat_id=query.message.chat.id,
+            message_id=query.message.id,
+            media=InputMediaPhoto(media=SUBSCRIPTION, caption=caption, parse_mode=enums.ParseMode.HTML),
+            reply_markup=buttons,
+        )
+    except Exception:
+        logger.exception("Could not show premium payment plans")
+    await query.answer()
 
 
 @Client.on_message(filters.group & filters.text & filters.incoming & ~filters.regex(r"^/"))
@@ -1315,8 +1680,10 @@ async def cb_handler(client: Client, query: CallbackQuery):
     elif query.data == "buy_info":
         try:
             btn = [[
+                InlineKeyboardButton('💳 ᴀᴜᴛᴏ ᴜᴘɪ', callback_data='pay_plan_menu'),
                 InlineKeyboardButton('ꜱᴛᴀʀ', callback_data='star_info'),
-                InlineKeyboardButton('ᴜᴘɪ', callback_data='upi_info')
+            ],[
+                InlineKeyboardButton('ᴍᴀɴᴜᴀʟ ᴜᴘɪ', callback_data='upi_info')
             ],[
                 InlineKeyboardButton('⇋ ʙᴀᴄᴋ ᴛᴏ ᴘʀᴇᴍɪᴜᴍ ⇋', callback_data='premium_info')
             ]]
