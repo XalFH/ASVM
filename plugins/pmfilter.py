@@ -56,114 +56,119 @@ _PAYMENT_MEMORY = {"monthly_price": DEFAULT_MONTHLY_PREMIUM_PRICE, "orders": {}}
 _PAYMENT_LOCKS = {}
 
 
-def _payment_collection(name):
-    """Return an optional Motor collection without assuming a specific wrapper."""
-    for attr in ("db", "database", "_db"):
-        database = getattr(mdb, attr, None)
-        if database is not None:
-            try:
-                return database[name]
-            except Exception:
-                try:
-                    return getattr(database, name)
-                except Exception:
-                    pass
-    try:
-        return mdb[name]
-    except Exception:
-        return None
-
-
 async def _payment_api_get(url):
     def _request():
-        request = urllib.request.Request(url, headers={"User-Agent": "PremiumPaymentBot/1.0"})
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "PremiumPaymentBot/1.0"},
+        )
         with urllib.request.urlopen(request, timeout=15) as response:
             raw = response.read().decode("utf-8", errors="replace")
             return json.loads(raw)
+
     return await asyncio.to_thread(_request)
 
 
 async def _get_monthly_price():
     try:
-        collection = _payment_collection("premium_payment_settings")
-        if collection is not None:
-            row = await collection.find_one({"_id": "premium_monthly_price"})
-            if row and int(row.get("amount", 0)) > 0:
-                _PAYMENT_MEMORY["monthly_price"] = int(row["amount"])
-                return int(row["amount"])
+        return await db.get_premium_monthly_price(DEFAULT_MONTHLY_PREMIUM_PRICE)
     except Exception:
-        logger.debug("Could not read premium price from MongoDB", exc_info=True)
-    return int(_PAYMENT_MEMORY.get("monthly_price", DEFAULT_MONTHLY_PREMIUM_PRICE))
+        logger.exception("Could not read premium monthly price from database")
+        return int(_PAYMENT_MEMORY.get("monthly_price", DEFAULT_MONTHLY_PREMIUM_PRICE))
 
 
 async def _set_monthly_price(amount):
-    _PAYMENT_MEMORY["monthly_price"] = int(amount)
+    amount = int(amount)
+    # Persist to MongoDB through users_chats_db.py; only fall back to memory
+    # if the database operation itself fails.
     try:
-        collection = _payment_collection("premium_payment_settings")
-        if collection is not None:
-            await collection.update_one(
-                {"_id": "premium_monthly_price"},
-                {"$set": {"amount": int(amount), "updated_at": int(time.time())}},
-                upsert=True,
-            )
+        await db.set_premium_monthly_price(amount)
     except Exception:
         logger.exception("Could not persist premium monthly price")
+        _PAYMENT_MEMORY["monthly_price"] = amount
+        raise
+    _PAYMENT_MEMORY["monthly_price"] = amount
 
 
 async def _save_payment_order(token, order):
-    _PAYMENT_MEMORY["orders"][token] = order
     try:
-        collection = _payment_collection("premium_payment_orders")
-        if collection is not None:
-            await collection.update_one({"_id": token}, {"$set": order}, upsert=True)
+        await db.save_premium_payment_order(token, order)
     except Exception:
         logger.exception("Could not persist premium payment order")
+        # Do not silently continue with a non-persistent order: a restart could
+        # otherwise lose the order and prevent payment verification.
+        raise
+    _PAYMENT_MEMORY["orders"][token] = dict(order)
 
 
 async def _get_payment_order(token):
     try:
-        collection = _payment_collection("premium_payment_orders")
-        if collection is not None:
-            row = await collection.find_one({"_id": token})
-            if row:
-                return row
+        row = await db.get_premium_payment_order(token)
+        if row:
+            return row
     except Exception:
-        logger.debug("Could not read payment order from MongoDB", exc_info=True)
+        logger.exception("Could not read premium payment order")
     return _PAYMENT_MEMORY["orders"].get(token)
 
 
 async def _update_payment_order(token, changes):
-    order = await _get_payment_order(token) or {}
+    try:
+        await db.update_premium_payment_order(token, changes)
+    except Exception:
+        logger.exception("Could not update premium payment order in MongoDB")
+        raise
+    order = _PAYMENT_MEMORY["orders"].get(token, {"_id": str(token), "token": str(token)})
     order.update(changes)
     _PAYMENT_MEMORY["orders"][token] = order
+
+async def _claim_payment_order(token):
+    """Atomically claim a pending order so separate bot workers cannot activate it twice."""
     try:
-        collection = _payment_collection("premium_payment_orders")
-        if collection is not None:
-            await collection.update_one({"_id": token}, {"$set": changes}, upsert=True)
+        result = await db.premium_payment_orders.update_one(
+            {"_id": str(token), "status": "pending"},
+            {"$set": {"status": "processing", "processing_started_at": int(time.time())}},
+        )
+        if result.modified_count == 1:
+            order = _PAYMENT_MEMORY["orders"].get(token, {"_id": str(token), "token": str(token)})
+            order.update({"status": "processing", "processing_started_at": int(time.time())})
+            _PAYMENT_MEMORY["orders"][token] = order
+            return True
+        return False
     except Exception:
-        logger.exception("Could not update payment order")
+        logger.exception("Could not claim premium payment order")
+        raise
+
+
+def _expiry_to_datetime(value):
+    """Normalize stored expiry values to a naive datetime used by this database."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromtimestamp(float(value))
+        except (TypeError, ValueError, OverflowError):
+            try:
+                parsed = datetime.fromisoformat(value)
+                return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 async def _activate_paid_premium(user_id, months):
-    """Activate premium through the bot's existing user database API."""
-    now = int(time.time())
-    current_expiry = 0
-    try:
-        user = await db.get_user(int(user_id))
-        if isinstance(user, dict):
-            for key in ("expiry_time", "premium_expiry", "expiry_date"):
-                value = user.get(key)
-                if value:
-                    try:
-                        current_expiry = int(float(value))
-                        break
-                    except (TypeError, ValueError):
-                        pass
-    except Exception:
-        logger.debug("Could not read existing premium expiry", exc_info=True)
-    expiry = max(now, current_expiry) + (int(months) * 30 * 24 * 60 * 60)
-    # This project already uses db.update_user for its premium database.
-    await db.update_user(int(user_id), expiry)
+    """Activate premium using the exact users_chats_db Database API/schema."""
+    user_id = int(user_id)
+    now = datetime.now()
+    current_expiry = None
+    user = await db.get_user(user_id)
+    if isinstance(user, dict):
+        current_expiry = _expiry_to_datetime(user.get("expiry_time"))
+    start = current_expiry if current_expiry and current_expiry > now else now
+    expiry = start + timedelta(days=int(months) * 30)
+    # update_user accepts a single user_data dict; expiry_time is a datetime.
+    await db.update_user({"id": user_id, "expiry_time": expiry})
     return expiry
 
 
@@ -199,17 +204,9 @@ async def my_premium_plan(client, message):
         user = await db.get_user(message.from_user.id)
     except Exception:
         logger.exception("Could not read user premium plan")
-    expiry = 0
-    if isinstance(user, dict):
-        for key in ("expiry_time", "premium_expiry", "expiry_date"):
-            try:
-                expiry = int(float(user.get(key) or 0))
-                if expiry:
-                    break
-            except (TypeError, ValueError):
-                continue
-    if expiry > int(time.time()):
-        expires_text = datetime.fromtimestamp(expiry, pytz.timezone(TIMEZONE)).strftime("%d %b %Y, %I:%M %p")
+    expiry = _expiry_to_datetime(user.get("expiry_time")) if isinstance(user, dict) else None
+    if expiry and expiry > datetime.now():
+        expires_text = expiry.strftime("%d %b %Y, %I:%M %p")
         text = f"✅ <b>Premium Active</b>\n\n📅 Expires: <code>{expires_text}</code>"
     else:
         text = "❌ <b>No active paid premium plan found.</b>\n\nUse /plan to view available options."
@@ -332,19 +329,25 @@ async def premium_payment_callbacks(client, query):
                     return await query.answer("⏳ Payment is still pending. Complete payment and try again.", show_alert=True)
                 if not amount_matches:
                     return await query.answer("❌ Amount verification failed. Please contact support.", show_alert=True)
-                await _update_payment_order(token, {"status": "processing", "transaction_id": status_data.get("transaction_id")})
+                claimed = await _claim_payment_order(token)
+                if not claimed:
+                    latest_order = await _get_payment_order(token) or {}
+                    if latest_order.get("status") == "success":
+                        return await query.answer("✅ Premium is already activated for this order.", show_alert=True)
+                    return await query.answer("⏳ This order is already being processed. Please wait a moment and check again.", show_alert=True)
+                await _update_payment_order(token, {"transaction_id": status_data.get("transaction_id")})
                 try:
                     expiry = await _activate_paid_premium(user_id, int(order["months"]))
                 except Exception:
-                    await _update_payment_order(token, {"status": "pending"})
+                    await _update_payment_order(token, {"status": "pending", "transaction_id": None})
                     raise
                 await _update_payment_order(token, {
                     "status": "success",
                     "transaction_id": status_data.get("transaction_id"),
                     "verified_at": int(time.time()),
-                    "premium_expiry": int(expiry),
+                    "premium_expiry": int(expiry.timestamp()),
                 })
-                expiry_text = datetime.fromtimestamp(expiry, pytz.timezone(TIMEZONE)).strftime("%d %b %Y, %I:%M %p")
+                expiry_text = expiry.strftime("%d %b %Y, %I:%M %p")
                 try:
                     await query.message.edit_caption(
                         caption=("<b>✅ PAYMENT VERIFIED SUCCESSFULLY</b>\n\n"
@@ -372,17 +375,9 @@ async def premium_payment_menu_callbacks(client, query):
             user = await db.get_user(query.from_user.id)
         except Exception:
             pass
-        expiry = 0
-        if isinstance(user, dict):
-            for key in ("expiry_time", "premium_expiry", "expiry_date"):
-                try:
-                    expiry = int(float(user.get(key) or 0))
-                    if expiry:
-                        break
-                except (TypeError, ValueError):
-                    continue
-        if expiry > int(time.time()):
-            exp_text = datetime.fromtimestamp(expiry, pytz.timezone(TIMEZONE)).strftime("%d %b %Y, %I:%M %p")
+        expiry = _expiry_to_datetime(user.get("expiry_time")) if isinstance(user, dict) else None
+        if expiry and expiry > datetime.now():
+            exp_text = expiry.strftime("%d %b %Y, %I:%M %p")
             return await query.answer(f"Premium active until {exp_text}", show_alert=True)
         return await query.answer("No active paid premium plan found.", show_alert=True)
 
