@@ -26,6 +26,7 @@ import math
 import random
 import pytz
 import json
+import html
 import time
 import uuid
 import urllib.request
@@ -213,6 +214,164 @@ async def my_premium_plan(client, message):
     await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
 
 
+# -------------------- Admin premium management commands --------------------
+async def _premium_admin_required(message):
+    if not message.from_user or not await _is_admin_user(message.from_user.id):
+        await message.reply_text("⛔ You are not authorized to use premium management commands.")
+        return False
+    return True
+
+
+def _premium_expiry_text(user):
+    expiry = _expiry_to_datetime(user.get("expiry_time")) if isinstance(user, dict) else None
+    if not expiry:
+        return None, False
+    active = expiry > datetime.now()
+    return expiry.strftime("%d %b %Y, %I:%M %p"), active
+
+
+@Client.on_message(filters.private & filters.command(["addpremium", "add_premium", "addprem", "add"]))
+async def admin_add_premium(client, message):
+    """Usage: /addpremium <user_id> <days>, or reply to a user with /addpremium <days>."""
+    if not await _premium_admin_required(message):
+        return
+
+    args = message.command[1:]
+    target_id = None
+    days = None
+    try:
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_id = int(message.reply_to_message.from_user.id)
+            if len(args) == 1:
+                days = int(args[0])
+        elif len(args) == 2:
+            target_id, days = int(args[0]), int(args[1])
+    except (TypeError, ValueError):
+        target_id, days = None, None
+
+    if not target_id or not days or days < 1 or days > 3650:
+        return await message.reply_text(
+            "Usage:\n<code>/addpremium USER_ID DAYS</code>\n"
+            "Or reply to a user's message with <code>/addpremium DAYS</code>.\n"
+            "Days must be between 1 and 3650.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    try:
+        user = await db.get_user(target_id) or {"id": target_id}
+        current_expiry = _expiry_to_datetime(user.get("expiry_time"))
+        now = datetime.now()
+        start = current_expiry if current_expiry and current_expiry > now else now
+        expiry = start + timedelta(days=days)
+        await db.update_user({"id": target_id, "expiry_time": expiry})
+        await message.reply_text(
+            f"✅ Premium added successfully.\n\n"
+            f"👤 User ID: <code>{target_id}</code>\n"
+            f"📆 Added: <b>{days} days</b>\n"
+            f"⏳ Expires: <code>{expiry.strftime('%d %b %Y, %I:%M %p')}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.exception("Failed to add premium to user %s", target_id)
+        await message.reply_text(f"❌ Could not add premium: <code>{html.escape(str(e)[:300])}</code>", parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_message(filters.private & filters.command(["getpremium", "get_premium", "getprem", "get"]))
+async def admin_get_premium(client, message):
+    if not await _premium_admin_required(message):
+        return
+    if len(message.command) != 2:
+        return await message.reply_text("Usage: <code>/getpremium USER_ID</code>", parse_mode=enums.ParseMode.HTML)
+    try:
+        user_id = int(message.command[1])
+        user = await db.get_user(user_id)
+        expiry_text, active = _premium_expiry_text(user)
+        if expiry_text and active:
+            text = ("✅ <b>Premium is ACTIVE</b>\n\n"
+                    f"👤 User ID: <code>{user_id}</code>\n"
+                    f"📅 Expires: <code>{expiry_text}</code>")
+        elif expiry_text:
+            text = ("❌ <b>Premium is EXPIRED</b>\n\n"
+                    f"👤 User ID: <code>{user_id}</code>\n"
+                    f"📅 Expired at: <code>{expiry_text}</code>")
+        else:
+            text = f"❌ No premium record found for user <code>{user_id}</code>."
+        await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+    except ValueError:
+        await message.reply_text("❌ User ID must be a number.")
+    except Exception as e:
+        logger.exception("Failed to get premium info")
+        await message.reply_text(f"❌ Could not get premium info: <code>{html.escape(str(e)[:300])}</code>", parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_message(filters.private & filters.command(["premiuminfo", "premium_info", "infopremium", "info"]))
+async def admin_premium_info(client, message):
+    # Same details as /getpremium; keep the familiar /info command alias.
+    await admin_get_premium(client, message)
+
+
+@Client.on_message(filters.private & filters.command(["totalpremium", "total_premium", "premiumcount", "total"]))
+async def admin_total_premium(client, message):
+    if not await _premium_admin_required(message):
+        return
+    try:
+        count = await db.all_premium_users()
+        await message.reply_text(f"💎 <b>Total active premium users:</b> <code>{count}</code>", parse_mode=enums.ParseMode.HTML)
+    except Exception as e:
+        logger.exception("Failed to count premium users")
+        await message.reply_text(f"❌ Could not count premium users: <code>{html.escape(str(e)[:300])}</code>", parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_message(filters.private & filters.command(["premiumlist", "premium_list", "listpremium"]))
+async def admin_premium_list(client, message):
+    if not await _premium_admin_required(message):
+        return
+    try:
+        cursor = await db.get_all_premium_user_data()
+        rows = []
+        async for user in cursor:
+            expiry_text, active = _premium_expiry_text(user)
+            if active:
+                rows.append(f"• <code>{int(user.get('id', 0))}</code> — <code>{expiry_text}</code>")
+        if not rows:
+            return await message.reply_text("No active premium users found.")
+        # Keep each Telegram message comfortably below the message length limit.
+        header = f"💎 <b>Active premium users: {len(rows)}</b>\n\n"
+        chunks, current = [], header
+        for row in rows:
+            if len(current) + len(row) + 1 > 3500:
+                chunks.append(current)
+                current = "💎 <b>Active premium users (continued)</b>\n\n"
+            current += row + "\n"
+        if current.strip():
+            chunks.append(current)
+        for chunk in chunks:
+            await message.reply_text(chunk, parse_mode=enums.ParseMode.HTML)
+    except Exception as e:
+        logger.exception("Failed to list premium users")
+        await message.reply_text(f"❌ Could not list premium users: <code>{html.escape(str(e)[:300])}</code>", parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_message(filters.private & filters.command(["removepremium", "remove_premium", "delpremium"]))
+async def admin_remove_premium(client, message):
+    if not await _premium_admin_required(message):
+        return
+    if len(message.command) != 2:
+        return await message.reply_text("Usage: <code>/removepremium USER_ID</code>", parse_mode=enums.ParseMode.HTML)
+    try:
+        user_id = int(message.command[1])
+        user = await db.get_user(user_id)
+        if not user:
+            return await message.reply_text("No premium record found for that user.")
+        await db.remove_premium_access(user_id)
+        await message.reply_text(f"✅ Premium removed for user <code>{user_id}</code>.", parse_mode=enums.ParseMode.HTML)
+    except ValueError:
+        await message.reply_text("❌ User ID must be a number.")
+    except Exception as e:
+        logger.exception("Failed to remove premium")
+        await message.reply_text(f"❌ Could not remove premium: <code>{html.escape(str(e)[:300])}</code>", parse_mode=enums.ParseMode.HTML)
+
+
 @Client.on_callback_query(filters.regex(r"^(paymonths|checkpay)#"))
 async def premium_payment_callbacks(client, query):
     data_parts = query.data.split("#")
@@ -348,6 +507,30 @@ async def premium_payment_callbacks(client, query):
                     "premium_expiry": int(expiry.timestamp()),
                 })
                 expiry_text = expiry.strftime("%d %b %Y, %I:%M %p")
+
+                # Notify the configured log channel only after the gateway confirms
+                # payment and premium activation has been saved successfully.
+                try:
+                    buyer = query.from_user
+                    buyer_name = html.escape(buyer.first_name or "Unknown")
+                    buyer_username = f"@{html.escape(buyer.username)}" if buyer.username else "N/A"
+                    await client.send_message(
+                        chat_id=LOG_CHANNEL,
+                        text=(
+                            "💎 <b>PREMIUM PURCHASE SUCCESSFUL</b>\n\n"
+                            f"👤 Buyer: {buyer_name} ({buyer_username})\n"
+                            f"🆔 User ID: <code>{int(user_id)}</code>\n"
+                            f"📦 Plan: <b>{int(order['months'])} month(s)</b>\n"
+                            f"💰 Amount: <b>₹{int(order['amount'])}</b>\n"
+                            f"🧾 Order ID: <code>{html.escape(str(order.get('order_id', 'N/A')))}</code>\n"
+                            f"🔖 Transaction ID: <code>{html.escape(str(status_data.get('transaction_id') or 'N/A'))}</code>\n"
+                            f"📅 Premium expiry: <code>{expiry_text}</code>"
+                        ),
+                        parse_mode=enums.ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    logger.exception("Could not send premium purchase alert to LOG_CHANNEL=%s", LOG_CHANNEL)
                 try:
                     await query.message.edit_caption(
                         caption=("<b>✅ PAYMENT VERIFIED SUCCESSFULLY</b>\n\n"
