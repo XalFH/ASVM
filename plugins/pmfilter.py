@@ -196,22 +196,152 @@ async def set_premium_monthly_price(client, message):
     await message.reply_text(f"✅ Premium monthly price set to <b>₹{amount}</b>.", parse_mode=enums.ParseMode.HTML)
 
 
+def _ist_datetime(value):
+    """Format Unix timestamps/datetimes in India Standard Time."""
+    ist = pytz.timezone(TIMEZONE)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), ist)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            # Database datetimes are stored naive; treat them as UTC only when
+            # they came from Unix timestamps, otherwise preserve local fields.
+            return ist.localize(value)
+        return value.astimezone(ist)
+    if isinstance(value, str):
+        try:
+            return _ist_datetime(float(value))
+        except (TypeError, ValueError):
+            try:
+                return _ist_datetime(datetime.fromisoformat(value))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _plan_details_text(user_id):
+    user = None
+    try:
+        user = await db.get_user(int(user_id))
+    except Exception:
+        logger.exception("Could not read user premium plan: %s", user_id)
+
+    expiry = _expiry_to_datetime(user.get("expiry_time")) if isinstance(user, dict) else None
+    now = datetime.now()
+    active = bool(expiry and expiry > now)
+    orders = []
+    try:
+        cursor = db.premium_payment_orders.find({"user_id": int(user_id), "status": "success"}).sort("verified_at", -1)
+        async for row in cursor:
+            orders.append(row)
+    except Exception:
+        logger.exception("Could not load premium purchase history for %s", user_id)
+
+    latest = orders[0] if orders else {}
+    purchase_ts = latest.get("verified_at") or latest.get("created_at")
+    purchase_dt = _ist_datetime(purchase_ts)
+    expiry_text = expiry.strftime("%d %b %Y") if expiry else "Not available"
+    expiry_time = expiry.strftime("%I:%M %p") if expiry else "Not available"
+    buy_date = purchase_dt.strftime("%d %b %Y") if purchase_dt else "Not available"
+    buy_time = purchase_dt.strftime("%I:%M %p") if purchase_dt else "Not available"
+    months = int(latest.get("months", 0) or 0)
+    extra_days = int((user or {}).get("extra_premium_days", latest.get("extra_days", 0)) or 0) if isinstance(user, dict) else int(latest.get("extra_days", 0) or 0)
+    remaining_days = max(0, (expiry.date() - now.date()).days) if active and expiry else 0
+    if active:
+        status = "🟢 Active"
+        plan_name = f"Premium · {months} month(s)" if months else "Premium · Admin/Manual grant"
+    else:
+        status = "🔴 Expired / Inactive"
+        plan_name = f"Premium · {months} month(s)" if months else "No active plan"
+
+    return (
+        "💎 <b>YOUR PREMIUM PLAN</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>Current Plan:</b> {html.escape(plan_name)}\n"
+        f"📊 <b>Status:</b> {status}\n\n"
+        f"🛒 <b>Buy Date:</b> <code>{html.escape(buy_date)}</code>\n"
+        f"🕒 <b>Buy Time:</b> <code>{html.escape(buy_time)}</code>\n\n"
+        f"📅 <b>End Date:</b> <code>{html.escape(expiry_text)}</code>\n"
+        f"🕒 <b>End Time:</b> <code>{html.escape(expiry_time)}</code>\n"
+        f"🎁 <b>Extra Premium:</b> <code>{extra_days} day(s)</code>\n"
+        f"⏳ <b>Days Remaining:</b> <code>{remaining_days}</code>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Use <b>History</b> to view previous successful purchases."
+    )
+
+
 @Client.on_message(filters.private & filters.command("myplan"))
 async def my_premium_plan(client, message):
     if not message.from_user:
         return
-    user = None
+    command_id = message.id
+    text = await _plan_details_text(message.from_user.id)
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📜 History", callback_data=f"plan_history#{command_id}"),
+         InlineKeyboardButton("🔙 Back", callback_data=f"plan_back#{command_id}")],
+        [InlineKeyboardButton("💎 Buy Plan", callback_data="pay_plan_menu")],
+    ])
+    await message.reply_text(text, reply_markup=buttons, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
+
+
+@Client.on_callback_query(filters.regex(r"^plan_(history|back|historyback)#\d+$"))
+async def premium_plan_history_callbacks(client, query):
+    action, command_id = query.data.split("#", 1)
+    command_id = int(command_id)
+    if action == "back":
+        # Delete both the /myplan command and its panel, as requested.
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await client.delete_messages(query.message.chat.id, command_id)
+        except Exception:
+            pass
+        return await query.answer("Closed.")
+
+    if action == "historyback":
+        text = await _plan_details_text(query.from_user.id)
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📜 History", callback_data=f"plan_history#{command_id}"),
+             InlineKeyboardButton("🔙 Back", callback_data=f"plan_back#{command_id}")],
+            [InlineKeyboardButton("💎 Buy Plan", callback_data="pay_plan_menu")],
+        ])
+        await query.message.edit_text(text, reply_markup=buttons, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
+        return await query.answer()
+
+    rows = []
     try:
-        user = await db.get_user(message.from_user.id)
+        cursor = db.premium_payment_orders.find({"user_id": int(query.from_user.id), "status": "success"}).sort("verified_at", -1)
+        async for row in cursor:
+            when = _ist_datetime(row.get("verified_at") or row.get("created_at"))
+            buy_date = when.strftime("%d %b %Y") if when else "Unknown"
+            buy_time = when.strftime("%I:%M %p") if when else "Unknown"
+            expiry = _ist_datetime(row.get("premium_expiry"))
+            expiry_text = expiry.strftime("%d %b %Y, %I:%M %p") if expiry else "See current plan"
+            months = int(row.get("months", 0) or 0)
+            amount = row.get("amount", "N/A")
+            order_id = html.escape(str(row.get("order_id", "N/A")))
+            txn = html.escape(str(row.get("transaction_id") or "N/A"))
+            rows.append(
+                f"<b>#{len(rows) + 1} · Premium Purchase</b>\n"
+                f"🛒 Bought: <code>{buy_date}</code> · <code>{buy_time}</code>\n"
+                f"📦 Plan: <b>{months} month(s)</b>\n"
+                f"💰 Paid: <b>₹{html.escape(str(amount))}</b>\n"
+                f"📅 Expiry: <code>{html.escape(expiry_text)}</code>\n"
+                f"🧾 Order: <code>{order_id}</code>\n"
+                f"🔖 Transaction: <code>{txn}</code>"
+            )
     except Exception:
-        logger.exception("Could not read user premium plan")
-    expiry = _expiry_to_datetime(user.get("expiry_time")) if isinstance(user, dict) else None
-    if expiry and expiry > datetime.now():
-        expires_text = expiry.strftime("%d %b %Y, %I:%M %p")
-        text = f"✅ <b>Premium Active</b>\n\n📅 Expires: <code>{expires_text}</code>"
-    else:
-        text = "❌ <b>No active paid premium plan found.</b>\n\nUse /plan to view available options."
-    await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+        logger.exception("Could not load premium history for %s", query.from_user.id)
+
+    history_text = "📜 <b>PREMIUM PURCHASE HISTORY</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+    history_text += "\n\n━━━━━━━━━━━━━━━━━━\n\n".join(rows) if rows else "No successful purchase history found yet.\n\nNew verified purchases will appear here."
+    # Telegram text limit safety: keep history within one editable panel.
+    if len(history_text) > 3800:
+        history_text = history_text[:3700] + "\n\n<i>Showing recent history only.</i>"
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Plan", callback_data=f"plan_historyback#{command_id}")]])
+    await query.message.edit_text(history_text, reply_markup=buttons, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
+    await query.answer()
 
 
 # -------------------- Admin premium management commands --------------------
@@ -263,7 +393,13 @@ async def admin_add_premium(client, message):
         now = datetime.now()
         start = current_expiry if current_expiry and current_expiry > now else now
         expiry = start + timedelta(days=days)
-        await db.update_user({"id": target_id, "expiry_time": expiry})
+        # Track admin-granted bonus days so /myplan can display Extra Premium.
+        previous_extra = int(user.get("extra_premium_days", 0) or 0)
+        await db.update_user({
+            "id": target_id,
+            "expiry_time": expiry,
+            "extra_premium_days": previous_extra + days,
+        })
         await message.reply_text(
             f"✅ Premium added successfully.\n\n"
             f"👤 User ID: <code>{target_id}</code>\n"
@@ -404,6 +540,7 @@ async def premium_payment_callbacks(client, query):
                 "order_id": str(order_id),
                 "user_id": int(user_id),
                 "months": int(months),
+                "extra_days": 0,
                 "amount": int(total_amount),
                 "payment_url": str(payment_url),
                 "status_check_url": str(status_url),
@@ -426,12 +563,18 @@ async def premium_payment_callbacks(client, query):
                 [InlineKeyboardButton("✅ Check Payment", callback_data=f"checkpay#{token}")],
                 [InlineKeyboardButton("↩️ Back to Plans", callback_data="pay_plan_menu")],
             ])
-            await client.edit_message_media(
-                chat_id=query.message.chat.id,
-                message_id=query.message.id,
-                media=InputMediaPhoto(media=SUBSCRIPTION, caption=caption, parse_mode=enums.ParseMode.HTML),
-                reply_markup=buttons,
-            )
+            # Edit the existing plan message in place. If it is a text message,
+            # Telegram cannot turn it into media via edit_message_media, so edit text.
+            try:
+                await query.message.edit_media(
+                    media=InputMediaPhoto(media=SUBSCRIPTION, caption=caption, parse_mode=enums.ParseMode.HTML),
+                    reply_markup=buttons,
+                )
+            except Exception:
+                await query.message.edit_text(
+                    caption, reply_markup=buttons, parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
         except Exception as e:
             logger.exception("Could not create premium payment order")
             fallback_buttons = InlineKeyboardMarkup([
@@ -505,6 +648,7 @@ async def premium_payment_callbacks(client, query):
                     "transaction_id": status_data.get("transaction_id"),
                     "verified_at": int(time.time()),
                     "premium_expiry": int(expiry.timestamp()),
+                    "premium_started_at": int(time.time()),
                 })
                 expiry_text = expiry.strftime("%d %b %Y, %I:%M %p")
 
@@ -531,19 +675,22 @@ async def premium_payment_callbacks(client, query):
                     )
                 except Exception:
                     logger.exception("Could not send premium purchase alert to LOG_CHANNEL=%s", LOG_CHANNEL)
+                success_text = (
+                    "<b>✅ PAYMENT VERIFIED SUCCESSFULLY</b>\n\n"
+                    f"📦 Plan: <b>{int(order['months'])} month(s)</b>\n"
+                    f"💰 Amount: <b>₹{int(order['amount'])}</b>\n"
+                    f"🆔 Order ID: <code>{html.escape(str(order.get('order_id', 'N/A')))}</code>\n"
+                    f"🧾 Transaction ID: <code>{html.escape(str(status_data.get('transaction_id') or 'N/A'))}</code>\n\n"
+                    f"🎉 Premium activated until <b>{expiry_text}</b>."
+                )
+                success_buttons = InlineKeyboardMarkup([[InlineKeyboardButton("📅 My Plan", callback_data="myplan_callback")]])
                 try:
-                    await query.message.edit_caption(
-                        caption=("<b>✅ PAYMENT VERIFIED SUCCESSFULLY</b>\n\n"
-                                 f"📦 Plan: <b>{int(order['months'])} month(s)</b>\n"
-                                 f"💰 Amount: <b>₹{int(order['amount'])}</b>\n"
-                                 f"🆔 Order ID: <code>{order['order_id']}</code>\n"
-                                 f"🧾 Transaction ID: <code>{status_data.get('transaction_id') or 'N/A'}</code>\n\n"
-                                 f"🎉 Premium activated until <b>{expiry_text}</b>."),
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📅 My Plan", callback_data="myplan_callback")]]),
-                        parse_mode=enums.ParseMode.HTML,
-                    )
+                    await query.message.edit_caption(success_text, reply_markup=success_buttons, parse_mode=enums.ParseMode.HTML)
                 except Exception:
-                    pass
+                    try:
+                        await query.message.edit_text(success_text, reply_markup=success_buttons, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
+                    except Exception:
+                        logger.exception("Could not update the existing payment message after success")
                 return await query.answer("✅ Payment verified and premium activated!", show_alert=True)
             except Exception as e:
                 logger.exception("Premium payment status check failed")
@@ -572,14 +719,16 @@ async def premium_payment_menu_callbacks(client, query):
         [InlineKeyboardButton("↩️ Back", callback_data="buy_info")],
     ])
     try:
-        await client.edit_message_media(
-            chat_id=query.message.chat.id,
-            message_id=query.message.id,
+        # Keep the flow in the same Telegram message; never send a separate payment page.
+        await query.message.edit_media(
             media=InputMediaPhoto(media=SUBSCRIPTION, caption=caption, parse_mode=enums.ParseMode.HTML),
             reply_markup=buttons,
         )
     except Exception:
-        logger.exception("Could not show premium payment plans")
+        try:
+            await query.message.edit_text(caption, reply_markup=buttons, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
+        except Exception as exc:
+            logger.exception("Could not edit existing message with premium plans: %s", exc)
     await query.answer()
 
 
