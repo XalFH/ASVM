@@ -559,9 +559,9 @@ async def premium_payment_callbacks(client, query):
                 "3. Premium activates only after the gateway confirms success."
             )
             buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Pay Now", url=str(payment_url))],
-                [InlineKeyboardButton("✅ Check Payment", callback_data=f"checkpay#{token}")],
-                [InlineKeyboardButton("↩️ Back to Plans", callback_data="pay_plan_menu")],
+                [InlineKeyboardButton("ᴘᴀʏ ɴᴏᴡ", url=str(payment_url))],
+                [InlineKeyboardButton("ᴄʜᴇᴄᴋ ᴘᴀʏᴍᴇɴᴛ", callback_data=f"checkpay#{token}")],
+                [InlineKeyboardButton("ʙᴀᴄᴋ ᴛᴏ ᴘʟᴀɴs", callback_data="pay_plan_menu")],
             ])
             # Edit the existing plan message in place. If it is a text message,
             # Telegram cannot turn it into media via edit_message_media, so edit text.
@@ -579,7 +579,7 @@ async def premium_payment_callbacks(client, query):
             logger.exception("Could not create premium payment order")
             fallback_buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton("↩️ Manual UPI", callback_data="upi_info")],
-                [InlineKeyboardButton("↩️ Back to Plans", callback_data="pay_plan_menu")],
+                [InlineKeyboardButton("ʙᴀᴄᴋ ᴛᴏ ᴘʟᴀɴs", callback_data="pay_plan_menu")],
             ])
             try:
                 await client.edit_message_media(
@@ -714,9 +714,9 @@ async def premium_payment_menu_callbacks(client, query):
     price = await _get_monthly_price()
     caption = f"<b>💎 CHOOSE YOUR PREMIUM PLAN</b>\n\nMonthly price: <b>₹{price}</b>\nSelect the duration below."
     buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"1 Month · ₹{price}", callback_data="paymonths#1"), InlineKeyboardButton(f"3 Months · ₹{price * 3}", callback_data="paymonths#3")],
-        [InlineKeyboardButton(f"6 Months · ₹{price * 6}", callback_data="paymonths#6"), InlineKeyboardButton(f"12 Months · ₹{price * 12}", callback_data="paymonths#12")],
-        [InlineKeyboardButton("↩️ Back", callback_data="buy_info")],
+        [InlineKeyboardButton(f"1 ᴍᴏɴᴛʜ · ₹{price}", callback_data="paymonths#1"), InlineKeyboardButton(f"3 ᴍᴏɴᴛʜs · ₹{price * 3}", callback_data="paymonths#3")],
+        [InlineKeyboardButton(f"6 ᴍᴏɴᴛʜs · ₹{price * 6}", callback_data="paymonths#6"), InlineKeyboardButton(f"12 ᴍᴏɴᴛʜs · ₹{price * 12}", callback_data="paymonths#12")],
+        [InlineKeyboardButton("ʙᴀᴄᴋ", callback_data="buy_info")],
     ])
     try:
         # Keep the flow in the same Telegram message; never send a separate payment page.
@@ -1984,6 +1984,16 @@ async def cb_handler(client: Client, query: CallbackQuery):
                 parse_mode=enums.ParseMode.HTML
             )
 
+    elif query.data == "delete_payment_panel":
+        try:
+            await query.message.delete()
+        except Exception:
+            logger.exception("Could not delete the manual payment panel")
+        try:
+            await query.answer("Closed.")
+        except Exception:
+            pass
+
     elif query.data == "premium_info":
         try:
             btn = [[
@@ -2007,9 +2017,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
     elif query.data == "buy_info":
         try:
             btn = [[
-                InlineKeyboardButton('💳 ᴀᴜᴛᴏ ᴜᴘɪ', callback_data='pay_plan_menu'),
-                InlineKeyboardButton('ꜱᴛᴀʀ', callback_data='star_info'),
-            ],[
+                InlineKeyboardButton('ᴀᴜᴛᴏ ᴜᴘɪ', callback_data='pay_plan_menu'),
                 InlineKeyboardButton('ᴍᴀɴᴜᴀʟ ᴜᴘɪ', callback_data='upi_info')
             ],[
                 InlineKeyboardButton('⇋ ʙᴀᴄᴋ ᴛᴏ ᴘʀᴇᴍɪᴜᴍ ⇋', callback_data='premium_info')
@@ -2027,15 +2035,22 @@ async def cb_handler(client: Client, query: CallbackQuery):
     elif query.data == "upi_info":
         try:
             btn = [[
-                InlineKeyboardButton('• ꜱᴇɴᴅ  ᴘᴀʏᴍᴇɴᴛ ꜱᴄʀᴇᴇɴꜱʜᴏᴛ •', url=OWNER_LNK),
+                InlineKeyboardButton('• ꜱᴇɴᴅ ᴘᴀʏᴍᴇɴᴛ ꜱᴄʀᴇᴇɴꜱʜᴏᴛ •', url=OWNER_LNK),
             ],[
-                InlineKeyboardButton('⇋ ʙᴀᴄᴋ ⇋', callback_data='buy_info')
+                InlineKeyboardButton('⇋ ʙᴀᴄᴋ ⇋', callback_data='delete_payment_panel')
             ]]
             reply_markup = InlineKeyboardMarkup(btn)
             await client.edit_message_media(
                 chat_id=query.message.chat.id,
                 message_id=query.message.id,
-                media=InputMediaPhoto(media=SUBSCRIPTION, caption=script.PREMIUM_UPI_TEXT.format(OWNER_UPI_ID), parse_mode=enums.ParseMode.HTML),
+                media=InputMediaPhoto(media=SUBSCRIPTION, caption=(
+                    '<b>▌ ᴍᴀɴᴜᴀʟ ᴜᴘɪ ᴘᴀʏᴍᴇɴᴛ  ❞</b>\n\n'
+                    'You can purchase premium using UPI or net banking.\n\n'
+                    f'💰 <b>UPI ID:</b> <code>{html.escape(str(OWNER_UPI_ID or 'NOT AVAILABLE'))}</code>\n\n'
+                    '📸 <b>After completing the payment, send the transaction screenshot to the admin.</b>\n\n'
+                    '⌛ The admin will verify your payment and manually activate your premium subscription.\n\n'
+                    '💡 For automatic payment verification, select Auto UPI from the premium menu.'
+                ), parse_mode=enums.ParseMode.HTML),
                 reply_markup=reply_markup
             )
         except Exception:
